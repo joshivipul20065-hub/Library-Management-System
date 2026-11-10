@@ -75,6 +75,7 @@ Check PHP before you start:
 ```bash
 php -v
 php -m | grep -iE "pdo_mysql|curl|fileinfo|mbstring|openssl"
+# Windows (PowerShell/cmd): php -m | findstr /i "pdo_mysql curl fileinfo mbstring openssl"
 php -r "var_dump(defined('PASSWORD_ARGON2ID'));"     # must print bool(true)
 ```
 
