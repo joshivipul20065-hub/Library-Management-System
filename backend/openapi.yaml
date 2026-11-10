@@ -1,0 +1,782 @@
+openapi: 3.0.3
+info:
+  title: Library Management System API
+  version: 1.0.0
+  description: |
+    REST API for the library catalogue, circulation (issue / return / renew / lost), reservations,
+    fines, student self-service and reports.
+
+    **Authentication:** `POST /auth/login` returns a short-lived JWT access token (15 min) in the body
+    and sets a `refresh_token` httpOnly cookie (7 days, `SameSite=Strict`, path `/api/v1/auth`).
+    Send the access token as `Authorization: Bearer <token>`. Call `POST /auth/refresh` (with header
+    `X-Requested-With: XMLHttpRequest`) to rotate the refresh token and get a new access token.
+
+    **Errors** always look like `{ "error": { "code", "message", "details" } }`.
+    Validation errors are `422 VALIDATION_ERROR` with `details` mapping field → message; business-rule
+    conflicts are `409` with a specific code (e.g. `UNPAID_FINES`, `MAX_BOOKS_REACHED`, `COPY_UNAVAILABLE`).
+
+    **Lists** accept `page`, `limit` (max 100), `sort`, `order` (`asc`|`desc`) plus endpoint filters and
+    return `{ data: [...], meta: { page, limit, total, pages } }`.
+
+    **Reports** return CSV when called with `?format=csv`.
+servers:
+  - url: http://localhost:8080/api/v1
+    description: Docker (direct)
+  - url: http://localhost:5173/api/v1
+    description: Through the Vite dev proxy
+security:
+  - bearerAuth: []
+tags:
+  - name: Auth
+  - name: Catalogue
+  - name: Students
+  - name: Circulation
+  - name: Reservations
+  - name: Fines
+  - name: Self-service
+  - name: Reports
+  - name: Admin
+
+paths:
+  /health:
+    get:
+      tags: [Admin]
+      summary: Liveness check (also verifies the database connection)
+      security: []
+      responses:
+        '200': { description: OK }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Sign in (rate limited to 5 requests per minute per IP)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: admin@library.test }
+                password: { type: string, example: Admin@123 }
+      responses:
+        '200':
+          description: Signed in; sets the refresh_token cookie
+          content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Rotate the refresh cookie and issue a new access token
+      security: []
+      parameters: [{ $ref: '#/components/parameters/XRequestedWith' }]
+      responses:
+        '200':
+          description: New session
+          content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the refresh token and clear the cookie
+      security: []
+      parameters: [{ $ref: '#/components/parameters/XRequestedWith' }]
+      responses:
+        '204': { description: Signed out }
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Email a password reset link (always returns 200)
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { email: { type: string, format: email } } }
+      responses:
+        '200': { description: Accepted }
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Set a new password using the emailed token
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, password]
+              properties:
+                token: { type: string, pattern: '^[a-f0-9]{64}$' }
+                password: { type: string, minLength: 8, maxLength: 72 }
+      responses:
+        '200': { description: Password updated; all sessions revoked }
+        '422': { $ref: '#/components/responses/Error' }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user (with student profile for students)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/DataObject' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /auth/change-password:
+    put:
+      tags: [Auth]
+      summary: Change password; revokes other sessions and returns a fresh session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string, minLength: 8, maxLength: 72 }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Session' } } } }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /books:
+    get:
+      tags: [Catalogue]
+      summary: Search the catalogue (public)
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: sort, in: query, schema: { type: string, enum: [title, created_at, published_year, available, isbn] } }
+        - $ref: '#/components/parameters/Order'
+        - { name: q, in: query, description: 'Title, ISBN, publisher or author', schema: { type: string } }
+        - { name: title, in: query, schema: { type: string } }
+        - { name: author, in: query, schema: { type: string } }
+        - { name: isbn, in: query, schema: { type: string } }
+        - { name: category_id, in: query, schema: { type: integer } }
+        - { name: language, in: query, schema: { type: string } }
+        - { name: available, in: query, schema: { type: string, enum: ['0', '1'] } }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Page' } } } }
+    post:
+      tags: [Catalogue]
+      summary: Create a book (staff); `copies` generates barcoded copies
+      requestBody: { $ref: '#/components/requestBodies/Book' }
+      responses:
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/Error' }
+  /books/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Catalogue]
+      summary: Book details with authors (public)
+      security: []
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [Catalogue]
+      summary: Update a book (staff)
+      requestBody: { $ref: '#/components/requestBodies/Book' }
+      responses:
+        '200': { description: OK }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Catalogue]
+      summary: Soft-delete a book (admin); blocked while copies are on loan
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Error' }
+  /books/{id}/copies:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Catalogue]
+      summary: List copies with current borrower (staff)
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Catalogue]
+      summary: Add copies by count (auto barcodes) or explicit barcodes (staff)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                count: { type: integer, minimum: 1, maximum: 100 }
+                barcodes: { type: array, items: { type: string } }
+      responses:
+        '201': { description: Copies added }
+  /books/{id}/cover:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    post:
+      tags: [Catalogue]
+      summary: Upload a cover image (JPEG/PNG/WebP, max 2 MB; staff)
+      requestBody:
+        content:
+          multipart/form-data:
+            schema: { type: object, properties: { cover: { type: string, format: binary } } }
+      responses:
+        '200': { description: OK }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [Catalogue]
+      summary: Remove the cover (staff); deletes the file if it was uploaded
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '204': { description: Removed }
+        '404': { $ref: '#/components/responses/Error' }
+  /books/import:
+    post:
+      tags: [Catalogue]
+      summary: Bulk import books from CSV (staff)
+      description: 'Columns: isbn, title, authors (";"-separated), category, publisher, edition, published_year, language, description, shelf_location, copies'
+      requestBody:
+        content:
+          multipart/form-data:
+            schema: { type: object, properties: { file: { type: string, format: binary } } }
+      responses:
+        '200': { description: 'Import summary { created, failed, errors[] }' }
+  /copies/{barcode}:
+    get:
+      tags: [Catalogue]
+      summary: Look up a copy by barcode (staff, issue desk)
+      parameters: [{ name: barcode, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /isbn-lookup/{isbn}:
+    get:
+      tags: [Catalogue]
+      summary: Fetch book details for an ISBN from Open Library (staff)
+      description: |
+        Free Open Library lookup used by the "Fetch details" button to pre-fill the book form. Hyphens and spaces in
+        the ISBN are ignored. Records that look like spam (no authors, publisher equal to title) are treated as not found.
+      parameters: [{ name: isbn, in: path, required: true, schema: { type: string, example: '9780141439518' } }]
+      responses:
+        '200':
+          description: Details found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      isbn: { type: string }
+                      title: { type: string }
+                      authors: { type: array, items: { type: string } }
+                      publisher: { type: string, nullable: true }
+                      published_year: { type: integer, nullable: true }
+                      subjects: { type: array, items: { type: string } }
+                      cover_url: { type: string, nullable: true }
+                      source_url: { type: string, nullable: true }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+        '502':
+          description: Open Library unreachable (LOOKUP_UNAVAILABLE)
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  /categories:
+    get:
+      tags: [Catalogue]
+      summary: List categories (public)
+      security: []
+      parameters: [{ $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/Limit' }, { name: q, in: query, schema: { type: string } }]
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Catalogue]
+      summary: Create category (staff)
+      requestBody: { $ref: '#/components/requestBodies/Category' }
+      responses:
+        '201': { description: Created }
+  /categories/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put:
+      tags: [Catalogue]
+      summary: Update category (staff)
+      requestBody: { $ref: '#/components/requestBodies/Category' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [Catalogue]
+      summary: Delete category (admin; must have no books)
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Error' }
+  /authors:
+    get:
+      tags: [Catalogue]
+      summary: List authors (public)
+      security: []
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Catalogue]
+      summary: Create author (staff)
+      requestBody: { $ref: '#/components/requestBodies/Author' }
+      responses:
+        '201': { description: Created }
+  /authors/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    put:
+      tags: [Catalogue]
+      summary: Update author (staff)
+      requestBody: { $ref: '#/components/requestBodies/Author' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [Catalogue]
+      summary: Delete author (admin; must have no books)
+      responses:
+        '204': { description: Deleted }
+
+  /students:
+    get:
+      tags: [Students]
+      summary: List students with loan / fine counts (staff)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: sort, in: query, schema: { type: string, enum: [name, roll_no, department, year, created_at] } }
+        - $ref: '#/components/parameters/Order'
+        - { name: q, in: query, schema: { type: string } }
+        - { name: department, in: query, schema: { type: string } }
+        - { name: year, in: query, schema: { type: integer } }
+        - { name: status, in: query, schema: { type: string, enum: [active, suspended] } }
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Students]
+      summary: Create a student account (staff). Without a password, a setup link is emailed.
+      requestBody: { $ref: '#/components/requestBodies/Student' }
+      responses:
+        '201': { description: Created }
+        '422': { $ref: '#/components/responses/Error' }
+  /students/{id}:
+    parameters: [{ $ref: '#/components/parameters/Id' }]
+    get:
+      tags: [Students]
+      summary: Student with borrowing eligibility (staff)
+      responses:
+        '200': { description: OK }
+    put:
+      tags: [Students]
+      summary: Update a student (staff)
+      requestBody: { $ref: '#/components/requestBodies/Student' }
+      responses:
+        '200': { description: OK }
+    delete:
+      tags: [Students]
+      summary: Soft-delete (admin); blocked with loans or unpaid fines
+      responses:
+        '204': { description: Deleted }
+        '409': { $ref: '#/components/responses/Error' }
+  /students/by-roll/{rollNo}:
+    get:
+      tags: [Students]
+      summary: Issue-desk lookup by roll number, including eligibility (staff)
+      parameters: [{ name: rollNo, in: path, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: OK }
+        '404': { $ref: '#/components/responses/Error' }
+  /students/{id}/suspend:
+    post:
+      tags: [Students]
+      summary: Suspend (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK } }
+  /students/{id}/activate:
+    post:
+      tags: [Students]
+      summary: Reactivate (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK } }
+  /students/{id}/history:
+    get:
+      tags: [Students]
+      summary: Borrowing history (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }, { $ref: '#/components/parameters/Page' }, { $ref: '#/components/parameters/Limit' }]
+      responses: { '200': { description: OK } }
+  /students/import:
+    post:
+      tags: [Students]
+      summary: Bulk import students from CSV (staff); each gets an account-setup email
+      description: 'Columns: name, email, roll_no, department, year, phone, address'
+      requestBody:
+        content:
+          multipart/form-data:
+            schema: { type: object, properties: { file: { type: string, format: binary } } }
+      responses:
+        '200': { description: Import summary }
+
+  /issues:
+    get:
+      tags: [Circulation]
+      summary: List loans (staff)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - { name: sort, in: query, schema: { type: string, enum: [id, issue_date, due_date, return_date, status, student, title] } }
+        - $ref: '#/components/parameters/Order'
+        - { name: status, in: query, schema: { type: string, enum: [active, issued, overdue, returned, lost] } }
+        - { name: overdue, in: query, schema: { type: string, enum: ['1'] } }
+        - { name: student_id, in: query, schema: { type: integer } }
+        - { name: book_id, in: query, schema: { type: integer } }
+        - { name: barcode, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: q, in: query, schema: { type: string } }
+      responses:
+        '200': { description: OK }
+    post:
+      tags: [Circulation]
+      summary: Issue a copy (staff). Runs in a transaction with row locks (no double issue).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [barcode]
+              properties:
+                roll_no: { type: string, description: Either roll_no or student_id }
+                student_id: { type: integer }
+                barcode: { type: string }
+                due_date: { type: string, format: date, description: Defaults to today + loan period }
+      responses:
+        '201': { description: Issued }
+        '404': { $ref: '#/components/responses/Error' }
+        '409':
+          description: 'ACCOUNT_SUSPENDED, UNPAID_FINES, MAX_BOOKS_REACHED, COPY_UNAVAILABLE, ALREADY_BORROWED, RESERVED_FOR_OTHERS'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  /issues/{id}:
+    get:
+      tags: [Circulation]
+      summary: Loan details (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK } }
+  /issues/{id}/fine-preview:
+    get:
+      tags: [Circulation]
+      summary: Fine that a return today would charge (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK } }
+  /issues/{id}/return:
+    post:
+      tags: [Circulation]
+      summary: Return a copy; creates an overdue fine and readies the next reservation (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: '{ issue, days_overdue, fine_amount, fine_id, reservation_ready }' }
+        '409': { $ref: '#/components/responses/Error' }
+  /issues/{id}/renew:
+    post:
+      tags: [Circulation]
+      summary: Renew (staff, or the borrowing student). Blocked when overdue, at max renewals, or reserved by others.
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: OK }
+        '409': { $ref: '#/components/responses/Error' }
+  /issues/{id}/mark-lost:
+    post:
+      tags: [Circulation]
+      summary: Mark lost; charges the replacement fee plus any overdue fine (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK } }
+  /issues/{id}/remind:
+    post:
+      tags: [Circulation]
+      summary: Send a reminder notification + email (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK } }
+
+  /reservations:
+    get:
+      tags: [Reservations]
+      summary: Reservation queue (staff)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - { name: status, in: query, schema: { type: string, enum: [active, pending, ready, fulfilled, cancelled, expired] } }
+        - { name: q, in: query, schema: { type: string } }
+      responses: { '200': { description: OK } }
+    post:
+      tags: [Reservations]
+      summary: Reserve a book (student). Becomes "ready" immediately if a copy is free.
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, required: [book_id], properties: { book_id: { type: integer } } }
+      responses:
+        '201': { description: Reserved }
+        '409': { $ref: '#/components/responses/Error' }
+  /reservations/{id}:
+    delete:
+      tags: [Reservations]
+      summary: Cancel (own reservation, or staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '204': { description: Cancelled } }
+  /reservations/{id}/fulfil:
+    post:
+      tags: [Reservations]
+      summary: Issue an available copy to the reserving student (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '201': { description: Issued } }
+
+  /fines:
+    get:
+      tags: [Fines]
+      summary: List fines (staff)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - { name: status, in: query, schema: { type: string, enum: [unpaid, paid, waived] } }
+        - { name: student_id, in: query, schema: { type: integer } }
+        - { name: q, in: query, schema: { type: string } }
+      responses: { '200': { description: OK } }
+  /fines/{id}/pay:
+    post:
+      tags: [Fines]
+      summary: Record payment (staff)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '200': { description: OK }, '409': { $ref: '#/components/responses/Error' } }
+  /fines/{id}/waive:
+    post:
+      tags: [Fines]
+      summary: Waive (admin)
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, properties: { reason: { type: string, maxLength: 255 } } }
+      responses: { '200': { description: OK } }
+
+  /me/dashboard:
+    get:
+      tags: [Self-service]
+      summary: 'Student dashboard: loans, due soon, overdue, fines owed, reservations, recommendations'
+      responses: { '200': { description: OK } }
+  /me/issues:
+    get:
+      tags: [Self-service]
+      summary: My loans (student); filter status=active for current
+      responses: { '200': { description: OK } }
+  /me/reservations:
+    get:
+      tags: [Self-service]
+      summary: My reservations (student)
+      responses: { '200': { description: OK } }
+  /me/fines:
+    get:
+      tags: [Self-service]
+      summary: My fines (student)
+      responses: { '200': { description: OK } }
+  /me/notifications:
+    get:
+      tags: [Self-service]
+      summary: My notifications; meta.unread holds the unread count
+      parameters: [{ name: unread, in: query, schema: { type: string, enum: ['1'] } }]
+      responses: { '200': { description: OK } }
+  /me/notifications/{id}/read:
+    post:
+      tags: [Self-service]
+      summary: Mark one notification read
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses: { '204': { description: OK } }
+  /me/notifications/read-all:
+    post:
+      tags: [Self-service]
+      summary: Mark all notifications read
+      responses: { '204': { description: OK } }
+  /me/profile:
+    put:
+      tags: [Self-service]
+      summary: Update own name (and phone / address for students)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                phone: { type: string, nullable: true }
+                address: { type: string, nullable: true }
+      responses: { '200': { description: OK } }
+
+  /reports/summary:
+    get:
+      tags: [Reports]
+      summary: KPI summary (staff)
+      parameters: [{ $ref: '#/components/parameters/Format' }]
+      responses: { '200': { description: JSON or CSV } }
+  /reports/popular-books:
+    get:
+      tags: [Reports]
+      summary: Most borrowed books in a date range (staff)
+      parameters: [{ $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Format' }]
+      responses: { '200': { description: JSON or CSV } }
+  /reports/top-categories:
+    get:
+      tags: [Reports]
+      summary: Most borrowed categories in a date range (staff)
+      parameters: [{ $ref: '#/components/parameters/From' }, { $ref: '#/components/parameters/To' }, { $ref: '#/components/parameters/Limit' }, { $ref: '#/components/parameters/Format' }]
+      responses: { '200': { description: JSON or CSV } }
+  /reports/overdue:
+    get:
+      tags: [Reports]
+      summary: Overdue loans with estimated fines (staff)
+      parameters: [{ $ref: '#/components/parameters/Format' }]
+      responses: { '200': { description: JSON or CSV } }
+  /reports/monthly-issues:
+    get:
+      tags: [Reports]
+      summary: Issues and returns per month (staff)
+      parameters: [{ name: months, in: query, schema: { type: integer, minimum: 1, maximum: 36, default: 12 } }, { $ref: '#/components/parameters/Format' }]
+      responses: { '200': { description: JSON or CSV } }
+
+  /audit-logs:
+    get:
+      tags: [Admin]
+      summary: Audit log of staff changes (admin)
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - { name: entity, in: query, schema: { type: string } }
+        - { name: action, in: query, schema: { type: string } }
+        - { name: user_id, in: query, schema: { type: integer } }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses: { '200': { description: OK } }
+  /settings:
+    get:
+      tags: [Admin]
+      summary: Circulation settings (staff)
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Settings' } } } } } }
+    put:
+      tags: [Admin]
+      summary: Update circulation settings (admin); any subset of fields
+      requestBody:
+        content: { application/json: { schema: { $ref: '#/components/schemas/Settings' } } }
+      responses: { '200': { description: OK }, '422': { $ref: '#/components/responses/Error' } }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: integer, minimum: 1 } }
+    Page: { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+    Limit: { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+    Order: { name: order, in: query, schema: { type: string, enum: [asc, desc] } }
+    From: { name: from, in: query, schema: { type: string, format: date } }
+    To: { name: to, in: query, schema: { type: string, format: date } }
+    Format: { name: format, in: query, schema: { type: string, enum: [csv] } }
+    XRequestedWith:
+      name: X-Requested-With
+      in: header
+      required: true
+      description: CSRF guard for cookie-authenticated endpoints
+      schema: { type: string, enum: [XMLHttpRequest] }
+  requestBodies:
+    Book:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [isbn, title]
+            properties:
+              isbn: { type: string, example: '9780132350884' }
+              title: { type: string, maxLength: 255 }
+              authors: { type: array, items: { type: string }, description: Author names; created if new }
+              category_id: { type: integer, nullable: true }
+              publisher: { type: string, nullable: true }
+              edition: { type: string, nullable: true }
+              published_year: { type: integer, nullable: true }
+              language: { type: string, nullable: true }
+              description: { type: string, nullable: true }
+              shelf_location: { type: string, nullable: true }
+              copies: { type: integer, minimum: 0, maximum: 100, description: Create only }
+              cover_url:
+                type: string
+                nullable: true
+                pattern: '^https://covers\.openlibrary\.org/b/(id|isbn|olid)/[A-Za-z0-9]+-[SML]\.jpg$'
+                description: Open Library cover link (from /isbn-lookup). Sets the cover; never clears an existing one.
+    Category:
+      content:
+        application/json:
+          schema: { type: object, required: [name], properties: { name: { type: string }, description: { type: string, nullable: true } } }
+    Author:
+      content:
+        application/json:
+          schema: { type: object, required: [name], properties: { name: { type: string } } }
+    Student:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [name, email, roll_no, department, year]
+            properties:
+              name: { type: string }
+              email: { type: string, format: email }
+              roll_no: { type: string }
+              department: { type: string }
+              year: { type: integer, minimum: 1, maximum: 8 }
+              phone: { type: string, nullable: true }
+              address: { type: string, nullable: true }
+              max_books: { type: integer, nullable: true, description: Overrides the global limit }
+              password: { type: string, nullable: true, description: Optional; omit to email a setup link }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details: { type: object, additionalProperties: true }
+    Session:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, example: 900 }
+        user: { $ref: '#/components/schemas/User' }
+    User:
+      type: object
+      properties:
+        id: { type: integer }
+        role: { type: string, enum: [admin, librarian, student] }
+        name: { type: string }
+        email: { type: string }
+        status: { type: string, enum: [active, suspended] }
+        student_id: { type: integer, nullable: true }
+    Settings:
+      type: object
+      properties:
+        loan_days: { type: integer, example: 14 }
+        max_books_per_student: { type: integer, example: 5 }
+        max_renewals: { type: integer, example: 3 }
+        fine_per_day: { type: number, example: 5 }
+        reservation_hold_hours: { type: integer, example: 48 }
+        lost_book_fee: { type: number, example: 500 }
+    DataObject:
+      type: object
+      properties: { data: { type: object, additionalProperties: true } }
+    Page:
+      type: object
+      properties:
+        data: { type: array, items: { type: object, additionalProperties: true } }
+        meta:
+          type: object
+          properties:
+            page: { type: integer }
+            limit: { type: integer }
+            total: { type: integer }
+            pages: { type: integer }

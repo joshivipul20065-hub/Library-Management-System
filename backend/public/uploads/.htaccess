@@ -1,0 +1,9 @@
+# Uploaded files are data, never code.
+php_flag engine off
+RemoveHandler .php .phtml .phar .php5 .php7 .phps
+RemoveType .php .phtml .phar .php5 .php7 .phps
+<FilesMatch "\.(?i:php\d?|phtml|phar|phps|html?|svg|js)$">
+    Require all denied
+</FilesMatch>
+Header set X-Content-Type-Options "nosniff"
+Header set Content-Security-Policy "default-src 'none'"

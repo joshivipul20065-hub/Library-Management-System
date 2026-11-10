@@ -1,0 +1,10 @@
+parameters:
+    level: 6
+    paths:
+        - src
+        - config
+        - bin
+        - tests
+    typeAliases:
+        Row: 'array<string, mixed>'
+        Page: 'array{data: list<array<string, mixed>>, meta: array{page: int, limit: int, total: int, pages: int}}'

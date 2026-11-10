@@ -1,0 +1,15 @@
+.env
+backend/.env
+backend/vendor/
+backend/logs/*.log
+backend/public/uploads/covers/*
+!backend/public/uploads/covers/.gitkeep
+backend/.phpunit.cache/
+backend/.phpcs-cache
+frontend/node_modules/
+frontend/dist/
+frontend/coverage/
+*.log
+.DS_Store
+.idea/
+.vscode/

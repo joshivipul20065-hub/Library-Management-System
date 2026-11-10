@@ -1,0 +1,7 @@
+vendor
+logs/*.log
+public/uploads/covers/*
+!public/uploads/covers/.gitkeep
+.phpunit.cache
+.phpcs-cache
+.env

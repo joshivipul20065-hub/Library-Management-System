@@ -1,0 +1,44 @@
+{
+    "name": "library/api",
+    "description": "Library Management System REST API",
+    "type": "project",
+    "license": "proprietary",
+    "require": {
+        "php": ">=8.2",
+        "ext-curl": "*",
+        "ext-fileinfo": "*",
+        "ext-json": "*",
+        "ext-pdo": "*",
+        "ext-pdo_mysql": "*",
+        "firebase/php-jwt": "^7.2",
+        "monolog/monolog": "^3",
+        "php-di/php-di": "^7",
+        "php-di/slim-bridge": "^3.4",
+        "phpmailer/phpmailer": "^6.9",
+        "respect/validation": "^2.3",
+        "slim/psr7": "^1.8",
+        "slim/slim": "^4",
+        "tuupola/cors-middleware": "^1.5",
+        "vlucas/phpdotenv": "^5.8"
+    },
+    "autoload": {
+        "psr-4": { "App\\": "src/" }
+    },
+    "autoload-dev": {
+        "psr-4": { "Tests\\": "tests/" }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "stan": "phpstan analyse --memory-limit=1G",
+        "cs": "phpcs",
+        "cs-fix": "phpcbf"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "require-dev": {
+        "phpstan/phpstan": "^2",
+        "phpunit/phpunit": "^11",
+        "squizlabs/php_codesniffer": "^3"
+    }
+}
